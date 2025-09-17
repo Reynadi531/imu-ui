@@ -2,15 +2,45 @@ import sys
 import json
 import requests
 import csv
+import threading
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QLabel, QSpinBox, QLineEdit, QFormLayout, QTextEdit, QFileDialog
 )
 from PySide6.QtNetwork import QUdpSocket, QHostAddress
+from PySide6.QtCore import QObject, Signal, Slot, QThread
 import pyqtgraph as pg
 
 
+class UdpParseWorker(QObject):
+    parsed = Signal(str, float, float, float, float, float, float)  # ts, ax, ay, az, gx, gy, gz
+    bad = Signal(str)
+
+    @Slot(bytes)
+    def process(self, b: bytes):
+        try:
+            raw = b.decode("utf-8", errors="ignore")
+            msg = json.loads(raw)
+
+            ts = msg.get("timestamp", "")
+            ax = msg["accel"]["x"]
+            ay = msg["accel"]["y"]
+            az = msg["accel"]["z"]
+            gx = msg["gyro"]["x"]
+            gy = msg["gyro"]["y"]
+            gz = msg["gyro"]["z"]
+
+            self.parsed.emit(ts, ax, ay, az, gx, gy, gz)
+        except Exception as e:
+            self.bad.emit(f"Bad packet: {e}")
+
+
 class MainWindow(QWidget):
+    # Signals to cross threads
+    datagram_signal = Signal(bytes)
+    http_done = Signal(str, str)  # path, text
+    http_err = Signal(str, str)   # path, err text
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IMU Control UI")
@@ -74,7 +104,7 @@ class MainWindow(QWidget):
         self.reset_target_btn = QPushButton("Reset Target")
         form.addRow(self.set_target_btn, self.reset_target_btn)
 
-        # Realtime numeric readouts (NEW)
+        # Realtime numeric readouts
         mono = "font-family: monospace"
         self.ax_lbl = QLabel("0.000000"); self.ax_lbl.setStyleSheet(mono)
         self.ay_lbl = QLabel("0.000000"); self.ay_lbl.setStyleSheet(mono)
@@ -92,22 +122,24 @@ class MainWindow(QWidget):
         self.log.setReadOnly(True)
         main_layout.addWidget(self.log)
 
-        # Accelerometer plot
+        # Accelerometer plot with legend
         self.plot_accel = pg.PlotWidget(title="Accelerometer X/Y/Z (g)")
+        self.plot_accel.addLegend()
         self.accel_curves = [
-            self.plot_accel.plot(pen="r"),
-            self.plot_accel.plot(pen="g"),
-            self.plot_accel.plot(pen="b")
+            self.plot_accel.plot(pen="r", name="Accel X"),
+            self.plot_accel.plot(pen="g", name="Accel Y"),
+            self.plot_accel.plot(pen="b", name="Accel Z")
         ]
         self.data_ax, self.data_ay, self.data_az = [], [], []
         main_layout.addWidget(self.plot_accel)
 
-        # Gyroscope plot
+        # Gyroscope plot with legend
         self.plot_gyro = pg.PlotWidget(title="Gyroscope X/Y/Z (deg/s)")
+        self.plot_gyro.addLegend()
         self.gyro_curves = [
-            self.plot_gyro.plot(pen="r"),
-            self.plot_gyro.plot(pen="g"),
-            self.plot_gyro.plot(pen="b")
+            self.plot_gyro.plot(pen="r", name="Gyro X"),
+            self.plot_gyro.plot(pen="g", name="Gyro Y"),
+            self.plot_gyro.plot(pen="b", name="Gyro Z")
         ]
         self.data_gx, self.data_gy, self.data_gz = [], [], []
         main_layout.addWidget(self.plot_gyro)
@@ -120,18 +152,31 @@ class MainWindow(QWidget):
         # UDP socket (not bound until you press "Bind UDP")
         self.udp_socket = QUdpSocket()
 
+        # Background UDP parse thread
+        self.udp_thread = QThread(self)
+        self.udp_worker = UdpParseWorker()
+        self.udp_worker.moveToThread(self.udp_thread)
+        self.datagram_signal.connect(self.udp_worker.process)     # main -> worker
+        self.udp_worker.parsed.connect(self.on_parsed)            # worker -> main
+        self.udp_worker.bad.connect(self.on_bad_packet)           # worker -> main
+        self.udp_thread.start()
+
         # Signals
         self.start_btn.clicked.connect(lambda: self.send_http("/stream/start"))
         self.stop_btn.clicked.connect(lambda: self.send_http("/stream/stop"))
         self.toggle_btn.clicked.connect(lambda: self.send_http("/stream/toggle"))
         self.status_btn.clicked.connect(lambda: self.send_http("/status"))
-        self.recalib_btn.clicked.connect(lambda: self.send_http("/imu/recalibrate", post=True))
+        self.recalib_btn.clicked.connect(lambda: self.send_http("/recalibrate", post=True))
         self.clear_btn.clicked.connect(self.clear_data)
         self.save_btn.clicked.connect(self.save_csv)
         self.delay_spin.editingFinished.connect(self.set_delay)
         self.set_target_btn.clicked.connect(self.save_target)
         self.reset_target_btn.clicked.connect(lambda: self.send_http("/target/reset"))
         self.listen_btn.clicked.connect(self.bind_udp)
+
+        # HTTP results back to UI thread
+        self.http_done.connect(self.on_http_done)
+        self.http_err.connect(self.on_http_err)
 
     def _hbox(self, *widgets):
         hb = QHBoxLayout()
@@ -145,34 +190,44 @@ class MainWindow(QWidget):
         return self.esp_url.text().strip()
 
     def send_http(self, path, post=False):
-        try:
-            url = f"{self.base_url()}{path}"
-            if path.startswith("/imu/delay"):
-                r = requests.get(url, params={"ms": self.delay_spin.value()}, timeout=2)
-            elif path.startswith("/target/set"):
-                r = requests.get(url, params={
-                    "ip": self.target_ip.text(),
-                    "port": self.target_port.value()
-                }, timeout=2)
-            elif post:
-                r = requests.post(url, timeout=2)
-            else:
-                r = requests.get(url, timeout=2)
+        # Run requests in a background thread
+        def work():
+            try:
+                url = f"{self.base_url()}{path}"
+                if path.startswith("/imu/delay"):
+                    r = requests.get(url, params={"ms": self.delay_spin.value()}, timeout=2)
+                elif path.startswith("/target/set"):
+                    r = requests.get(url, params={
+                        "ip": self.target_ip.text(),
+                        "port": self.target_port.value()
+                    }, timeout=2)
+                elif post:
+                    r = requests.post(url, timeout=2)
+                else:
+                    r = requests.get(url, timeout=2)
+                self.http_done.emit(path, r.text)
+            except Exception as e:
+                self.http_err.emit(path, str(e))
+        threading.Thread(target=work, daemon=True).start()
 
-            if path == "/status":
-                self.status_label.setText(f"Status: {r.text}")
-                try:
-                    data = r.json()
-                    if "last_calibration" in data:
-                        self.calib_label.setText(
-                            f"Calibration: last={data['last_calibration']} calibrating={data['calibrating']}"
-                        )
-                except Exception:
-                    pass
-            self.log.append(f"HTTP {path}: {r.text}")
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            self.log.append(f"Error calling {path}: {e}")
+    @Slot(str, str)
+    def on_http_done(self, path, text):
+        if path == "/status":
+            self.status_label.setText(f"Status: {text}")
+            try:
+                data = json.loads(text)
+                if "last_calibration" in data:
+                    self.calib_label.setText(
+                        f"Calibration: last={data['last_calibration']} calibrating={data['calibrating']}"
+                    )
+            except Exception:
+                pass
+        self.log.append(f"HTTP {path}: {text}")
+
+    @Slot(str, str)
+    def on_http_err(self, path, err):
+        self.status_label.setText(f"Error: {err}")
+        self.log.append(f"Error calling {path}: {err}")
 
     def set_delay(self):
         self.send_http(f"/imu/delay")
@@ -216,7 +271,6 @@ class MainWindow(QWidget):
         self.log.append("Data cleared and plots reset")
 
     def save_csv(self):
-        from PySide6.QtWidgets import QFileDialog
         filename, _ = QFileDialog.getSaveFileName(self, "Save Data", "imu_data.csv", "CSV Files (*.csv)")
         if not filename:
             return
@@ -247,61 +301,56 @@ class MainWindow(QWidget):
         except Exception as e:
             self.log.append(f"Error saving CSV: {e}")
 
+    # Main thread: minimal work, just read datagrams and hand bytes to worker
     def on_udp(self):
         while self.udp_socket.hasPendingDatagrams():
             datagram, _, _ = self.udp_socket.readDatagram(self.udp_socket.pendingDatagramSize())
-            try:
-                raw = bytes(datagram).decode("utf-8", errors="ignore")
-                msg = json.loads(raw)
+            # hand off to worker thread
+            self.datagram_signal.emit(bytes(datagram))
 
-                # Timestamp
-                ts = msg.get("timestamp", "")
-                self.timestamps.append(ts)
+    # Parsed result comes back from worker here, update UI/plots
+    @Slot(str, float, float, float, float, float, float)
+    def on_parsed(self, ts, ax, ay, az, gx, gy, gz):
+        self.timestamps.append(ts)
 
-                # Accelerometer
-                ax = msg["accel"]["x"]
-                ay = msg["accel"]["y"]
-                az = msg["accel"]["z"]
-                self.data_ax.append(ax)
-                self.data_ay.append(ay)
-                self.data_az.append(az)
-                if len(self.data_ax) > 200:
-                    self.data_ax.pop(0)
-                    self.data_ay.pop(0)
-                    self.data_az.pop(0)
-                self.accel_curves[0].setData(self.data_ax)
-                self.accel_curves[1].setData(self.data_ay)
-                self.accel_curves[2].setData(self.data_az)
+        self.data_ax.append(ax); self.data_ay.append(ay); self.data_az.append(az)
+        self.data_gx.append(gx); self.data_gy.append(gy); self.data_gz.append(gz)
 
-                # Gyroscope
-                gx = msg["gyro"]["x"]
-                gy = msg["gyro"]["y"]
-                gz = msg["gyro"]["z"]
-                self.data_gx.append(gx)
-                self.data_gy.append(gy)
-                self.data_gz.append(gz)
-                if len(self.data_gx) > 200:
-                    self.data_gx.pop(0)
-                    self.data_gy.pop(0)
-                    self.data_gz.pop(0)
-                self.gyro_curves[0].setData(self.data_gx)
-                self.gyro_curves[1].setData(self.data_gy)
-                self.gyro_curves[2].setData(self.data_gz)
+        if len(self.data_ax) > 200:
+            self.data_ax.pop(0); self.data_ay.pop(0); self.data_az.pop(0)
+        if len(self.data_gx) > 200:
+            self.data_gx.pop(0); self.data_gy.pop(0); self.data_gz.pop(0)
 
-                # Update realtime numeric readouts (NEW)
-                self.ax_lbl.setText(f"{ax:.6f}")
-                self.ay_lbl.setText(f"{ay:.6f}")
-                self.az_lbl.setText(f"{az:.6f}")
-                self.gx_lbl.setText(f"{gx:.6f}")
-                self.gy_lbl.setText(f"{gy:.6f}")
-                self.gz_lbl.setText(f"{gz:.6f}")
+        self.accel_curves[0].setData(self.data_ax)
+        self.accel_curves[1].setData(self.data_ay)
+        self.accel_curves[2].setData(self.data_az)
 
-                self.log.append(
-                    f"UDP packet: ts={ts} accel=({ax:.3f},{ay:.3f},{az:.3f}) "
-                    f"gyro=({gx:.3f},{gy:.3f},{gz:.3f})"
-                )
-            except Exception as e:
-                self.log.append(f"Bad packet: {e}")
+        self.gyro_curves[0].setData(self.data_gx)
+        self.gyro_curves[1].setData(self.data_gy)
+        self.gyro_curves[2].setData(self.data_gz)
+
+        self.ax_lbl.setText(f"{ax:.6f}")
+        self.ay_lbl.setText(f"{ay:.6f}")
+        self.az_lbl.setText(f"{az:.6f}")
+        self.gx_lbl.setText(f"{gx:.6f}")
+        self.gy_lbl.setText(f"{gy:.6f}")
+        self.gz_lbl.setText(f"{gz:.6f}")
+
+        self.log.append(
+            f"UDP packet: ts={ts} accel=({ax:.3f},{ay:.3f},{az:.3f}) "
+            f"gyro=({gx:.3f},{gy:.3f},{gz:.3f})"
+        )
+
+    @Slot(str)
+    def on_bad_packet(self, msg):
+        self.log.append(msg)
+
+    def closeEvent(self, event):
+        # Ensure worker thread exits cleanly
+        if self.udp_thread.isRunning():
+            self.udp_thread.quit()
+            self.udp_thread.wait(1000)
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":

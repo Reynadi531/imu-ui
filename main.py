@@ -74,6 +74,17 @@ class MainWindow(QWidget):
         self.reset_target_btn = QPushButton("Reset Target")
         form.addRow(self.set_target_btn, self.reset_target_btn)
 
+        # Realtime numeric readouts (NEW)
+        mono = "font-family: monospace"
+        self.ax_lbl = QLabel("0.000000"); self.ax_lbl.setStyleSheet(mono)
+        self.ay_lbl = QLabel("0.000000"); self.ay_lbl.setStyleSheet(mono)
+        self.az_lbl = QLabel("0.000000"); self.az_lbl.setStyleSheet(mono)
+        self.gx_lbl = QLabel("0.000000"); self.gx_lbl.setStyleSheet(mono)
+        self.gy_lbl = QLabel("0.000000"); self.gy_lbl.setStyleSheet(mono)
+        self.gz_lbl = QLabel("0.000000"); self.gz_lbl.setStyleSheet(mono)
+        form.addRow("Accel X/Y/Z (g)", self._hbox(self.ax_lbl, self.ay_lbl, self.az_lbl))
+        form.addRow("Gyro X/Y/Z (deg/s)", self._hbox(self.gx_lbl, self.gy_lbl, self.gz_lbl))
+
         main_layout.addLayout(form)
 
         # Log window
@@ -103,7 +114,7 @@ class MainWindow(QWidget):
 
         self.setLayout(main_layout)
 
-        # Extra: store timestamps
+        # Extra: store timestamps for CSV
         self.timestamps = []
 
         # UDP socket (not bound until you press "Bind UDP")
@@ -114,13 +125,21 @@ class MainWindow(QWidget):
         self.stop_btn.clicked.connect(lambda: self.send_http("/stream/stop"))
         self.toggle_btn.clicked.connect(lambda: self.send_http("/stream/toggle"))
         self.status_btn.clicked.connect(lambda: self.send_http("/status"))
-        self.recalib_btn.clicked.connect(lambda: self.send_http("/imu/recalibrate"))
+        self.recalib_btn.clicked.connect(lambda: self.send_http("/imu/recalibrate", post=True))
         self.clear_btn.clicked.connect(self.clear_data)
         self.save_btn.clicked.connect(self.save_csv)
         self.delay_spin.editingFinished.connect(self.set_delay)
         self.set_target_btn.clicked.connect(self.save_target)
         self.reset_target_btn.clicked.connect(lambda: self.send_http("/target/reset"))
         self.listen_btn.clicked.connect(self.bind_udp)
+
+    def _hbox(self, *widgets):
+        hb = QHBoxLayout()
+        for w in widgets:
+            hb.addWidget(w)
+        container = QWidget()
+        container.setLayout(hb)
+        return container
 
     def base_url(self):
         return self.esp_url.text().strip()
@@ -150,7 +169,6 @@ class MainWindow(QWidget):
                         )
                 except Exception:
                     pass
-
             self.log.append(f"HTTP {path}: {r.text}")
         except Exception as e:
             self.status_label.setText(f"Error: {e}")
@@ -187,14 +205,18 @@ class MainWindow(QWidget):
         self.plot_accel.enableAutoRange()
         self.plot_gyro.enableAutoRange()
 
+        # Reset numeric readouts
+        self.ax_lbl.setText("0.000000")
+        self.ay_lbl.setText("0.000000")
+        self.az_lbl.setText("0.000000")
+        self.gx_lbl.setText("0.000000")
+        self.gy_lbl.setText("0.000000")
+        self.gz_lbl.setText("0.000000")
+
         self.log.append("Data cleared and plots reset")
 
     def save_csv(self):
         from PySide6.QtWidgets import QFileDialog
-        import csv
-
-        DECIMALS = 6  # adjust precision as needed
-
         filename, _ = QFileDialog.getSaveFileName(self, "Save Data", "imu_data.csv", "CSV Files (*.csv)")
         if not filename:
             return
@@ -202,8 +224,8 @@ class MainWindow(QWidget):
         n = min(len(self.timestamps), len(self.data_ax), len(self.data_ay), len(self.data_az),
                 len(self.data_gx), len(self.data_gy), len(self.data_gz))
 
+        DECIMALS = 6
         def f(x):
-            # fixed-point, no scientific notation
             return f"{float(x):.{DECIMALS}f}"
 
         try:
@@ -266,8 +288,18 @@ class MainWindow(QWidget):
                 self.gyro_curves[1].setData(self.data_gy)
                 self.gyro_curves[2].setData(self.data_gz)
 
-                self.log.append(f"UDP packet: ts={ts} accel=({ax:.3f},{ay:.3f},{az:.3f}) "
-                                f"gyro=({gx:.3f},{gy:.3f},{gz:.3f})")
+                # Update realtime numeric readouts (NEW)
+                self.ax_lbl.setText(f"{ax:.6f}")
+                self.ay_lbl.setText(f"{ay:.6f}")
+                self.az_lbl.setText(f"{az:.6f}")
+                self.gx_lbl.setText(f"{gx:.6f}")
+                self.gy_lbl.setText(f"{gy:.6f}")
+                self.gz_lbl.setText(f"{gz:.6f}")
+
+                self.log.append(
+                    f"UDP packet: ts={ts} accel=({ax:.3f},{ay:.3f},{az:.3f}) "
+                    f"gyro=({gx:.3f},{gy:.3f},{gz:.3f})"
+                )
             except Exception as e:
                 self.log.append(f"Bad packet: {e}")
 
